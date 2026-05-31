@@ -827,6 +827,7 @@ def skill_view(
     """
     try:
         local_category_name: str | None = None
+        qualified_bare_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
@@ -892,6 +893,7 @@ def skill_view(
             # gateway prompts, so preserve that form and translate it to the
             # on-disk `category/skill` path during the local scan below.
             if bare:
+                qualified_bare_name = bare
                 local_category_name = f"{namespace}/{bare}"
 
         from agent.skill_utils import get_external_skills_dirs
@@ -957,13 +959,20 @@ def skill_view(
             # Strategy 2: recursive by directory name (catches nested skills
             # like "foundations/runtime/explore-codebase" called by bare name).
             for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
+                if found_skill_md.parent.name == name or (
+                    qualified_bare_name
+                    and found_skill_md.parent.name == qualified_bare_name
+                ):
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
             for found_md in search_dir.rglob(f"{name}.md"):
                 if found_md.name != "SKILL.md":
                     _record(None, found_md)
+            if qualified_bare_name:
+                for found_md in search_dir.rglob(f"{qualified_bare_name}.md"):
+                    if found_md.name != "SKILL.md":
+                        _record(None, found_md)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
@@ -1360,6 +1369,8 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
+        if qualified_bare_name and skill_name == qualified_bare_name and name != skill_name:
+            result["resolved_from"] = name
 
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:

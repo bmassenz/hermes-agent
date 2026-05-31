@@ -4143,6 +4143,36 @@ class TestRetryExhaustion:
         assert "UnboundLocalError" not in result.get("error", "")
         assert "bad messages" in result["error"]
 
+    def test_custom_exception_retry_after_respected(self, agent):
+        """If a RateLimitError carries an explicit retry_after, the backoff wait must match it."""
+        self._setup_agent(agent)
+        from agent.google_code_assist import CodeAssistError
+        err = CodeAssistError("Gemini rate limit", status_code=429, retry_after=42.0)
+        agent.client.chat.completions.create.side_effect = err
+        from agent import conversation_loop as _conv_loop
+        status_messages = []
+        def _capture_status(msg):
+            status_messages.append(msg)
+        mock_time = self._make_fast_time_mock()
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_emit_status", side_effect=_capture_status),
+            patch("run_agent.time", mock_time),
+            patch.object(_conv_loop, "time", mock_time),
+        ):
+            result = agent.run_conversation("hello")
+        assert result.get("completed") is False
+        assert result.get("failed") is True
+        rate_limit_msgs = [m for m in status_messages if "Rate limited. Waiting" in m]
+        assert len(rate_limit_msgs) == 2
+        import re
+        match = re.search(r"Waiting (\d+\.\d+)s", rate_limit_msgs[0])
+        assert match, f"Could not find wait time in message: {rate_limit_msgs[0]}"
+        wait_val = float(match.group(1))
+        assert 42.5 <= wait_val <= 45.0, f"Wait time {wait_val} out of expected range [42.5, 45.0]"
+
 
 # ---------------------------------------------------------------------------
 # Conversation history mutation

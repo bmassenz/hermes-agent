@@ -3427,3 +3427,32 @@ class TestAuxUnhealthyCache:
             )
             # After the 402, OpenRouter is in the unhealthy cache.
             assert _is_provider_unhealthy("openrouter") is True
+
+
+def test_resolve_provider_client_resolves_google_gemini_cli(monkeypatch):
+    from agent.auxiliary_client import resolve_provider_client
+    from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+    from unittest.mock import MagicMock, patch
+
+    mock_creds = MagicMock()
+    mock_creds.project_id = "test-project-123"
+
+    with patch("agent.google_oauth.get_valid_access_token", return_value="dummy-access-token"), \
+         patch("agent.google_oauth.load_credentials", return_value=mock_creds):
+        client, model = resolve_provider_client("google-gemini-cli")
+        assert isinstance(client, GeminiCloudCodeClient)
+        assert model == "gemini-3-flash-preview"
+
+
+def test_resolve_provider_client_resolves_google_gemini_cli_async(monkeypatch):
+    from agent.auxiliary_client import resolve_provider_client, AsyncGeminiCloudCodeClient
+    from unittest.mock import MagicMock, patch
+
+    mock_creds = MagicMock()
+    mock_creds.project_id = "test-project-123"
+
+    with patch("agent.google_oauth.get_valid_access_token", return_value="dummy-access-token"), \
+         patch("agent.google_oauth.load_credentials", return_value=mock_creds):
+        client, model = resolve_provider_client("google-gemini-cli", async_mode=True)
+        assert isinstance(client, AsyncGeminiCloudCodeClient)
+        assert model == "gemini-3-flash-preview"

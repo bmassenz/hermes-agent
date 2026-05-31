@@ -1094,6 +1094,28 @@ class AsyncAnthropicAuxiliaryClient:
         self._real_client = sync_wrapper._real_client
 
 
+class _AsyncGeminiCompletionsAdapter:
+    def __init__(self, sync_client: Any):
+        self._sync = sync_client
+
+    async def create(self, **kwargs) -> Any:
+        import asyncio
+        return await asyncio.to_thread(self._sync.chat.completions.create, **kwargs)
+
+
+class _AsyncGeminiChatShim:
+    def __init__(self, adapter: _AsyncGeminiCompletionsAdapter):
+        self.completions = adapter
+
+
+class AsyncGeminiCloudCodeClient:
+    def __init__(self, sync_client: Any):
+        adapter = _AsyncGeminiCompletionsAdapter(sync_client)
+        self.chat = _AsyncGeminiChatShim(adapter)
+        self.api_key = sync_client.api_key
+        self.base_url = sync_client.base_url
+
+
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     """True if the endpoint at ``base_url`` speaks the Anthropic Messages
     protocol instead of OpenAI chat.completions.
@@ -1935,6 +1957,29 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
         default_headers=_codex_cloudflare_headers(codex_token),
     )
     return CodexAuxiliaryClient(real_client, model), model
+
+
+def _build_google_gemini_cli_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Build a GeminiCloudCodeClient for Google Gemini (OAuth)."""
+    try:
+        from agent.google_oauth import get_valid_access_token, load_credentials
+        access_token = get_valid_access_token()
+        creds = load_credentials()
+    except Exception as exc:
+        logger.debug("Failed to resolve Google Gemini credentials: %s", exc)
+        return None, None
+
+    from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+    client_kwargs = {
+        "api_key": access_token,
+        "base_url": "cloudcode-pa://google",
+    }
+    if creds and creds.project_id:
+        client_kwargs["project_id"] = creds.project_id
+
+    client = GeminiCloudCodeClient(**client_kwargs)
+    final_model = model or "gemini-3-flash-preview"
+    return client, final_model
 
 
 def _try_azure_foundry(
@@ -3138,6 +3183,12 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             return sync_client, model
     except ImportError:
         pass
+    try:
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+        if isinstance(sync_client, GeminiCloudCodeClient):
+            return AsyncGeminiCloudCodeClient(sync_client), model
+    except ImportError:
+        pass
 
     async_kwargs = {
         "api_key": sync_client.api_key,
@@ -3409,6 +3460,19 @@ def resolve_provider_client(
             logger.warning(
                 "resolve_provider_client: xai-oauth requested but no xAI "
                 "OAuth token found (run: hermes model -> xAI Grok OAuth — SuperGrok / Premium+)"
+            )
+            return None, None
+        final_model = _normalize_resolved_model(model or default, provider)
+        return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                else (client, final_model))
+
+    # ── Google Gemini OAuth (Cloud Code Assist) ──────────────────────
+    if provider == "google-gemini-cli":
+        client, default = _build_google_gemini_cli_client(model)
+        if client is None:
+            logger.warning(
+                "resolve_provider_client: google-gemini-cli requested but no "
+                "Gemini OAuth token found (run: hermes auth add google-gemini-cli --type oauth)"
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
@@ -3815,6 +3879,8 @@ def resolve_provider_client(
             return resolve_provider_client("openai-codex", model, async_mode)
         if provider == "xai-oauth":
             return resolve_provider_client("xai-oauth", model, async_mode)
+        if provider == "google-gemini-cli":
+            return resolve_provider_client("google-gemini-cli", model, async_mode)
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)

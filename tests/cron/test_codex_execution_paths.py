@@ -123,6 +123,51 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
 
 
+def test_cron_run_job_uses_cron_max_turns_before_agent_default(monkeypatch, tmp_path):
+    _patch_agent_bootstrap(monkeypatch)
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "model:",
+                "  default: gpt-5.4-mini",
+                "agent:",
+                "  max_turns: 35",
+                "cron:",
+                "  max_turns: 24",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cron_scheduler, "_hermes_home", hermes_home)
+    monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda requested=None: {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    _Codex401ThenSuccessAgent.refresh_attempts = 0
+    _Codex401ThenSuccessAgent.last_init = {}
+
+    success, output, final_response, error = cron_scheduler.run_job(
+        {"id": "job-1", "name": "Cron Max Turns Test", "prompt": "ping"}
+    )
+
+    assert success is True
+    assert error is None
+    assert final_response == "Recovered via refresh"
+    assert "Recovered via refresh" in output
+    assert _Codex401ThenSuccessAgent.last_init["max_iterations"] == 24
+
+
 def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)

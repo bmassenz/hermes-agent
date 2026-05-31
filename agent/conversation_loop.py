@@ -3346,15 +3346,22 @@ def run_conversation(
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
                 if is_rate_limited:
-                    _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                    if _resp_headers and hasattr(_resp_headers, "get"):
-                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                        if _ra_raw:
-                            try:
-                                _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
-                            except (TypeError, ValueError):
-                                pass
+                    _custom_ra = getattr(api_error, "retry_after", None)
+                    if isinstance(_custom_ra, (int, float)):
+                        _retry_after = min(float(_custom_ra), 120)  # Cap at 2 minutes
+                    else:
+                        _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                        if _resp_headers and hasattr(_resp_headers, "get"):
+                            _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
+                            if _ra_raw:
+                                try:
+                                    _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
+                                except (TypeError, ValueError):
+                                    pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                if _retry_after:
+                    # Add jitter to the parsed Retry-After to prevent thundering herd when multiple sessions retry concurrently
+                    wait_time = _retry_after + random.uniform(0.5, 3.0)
                 if is_rate_limited:
                     agent._buffer_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
                 else:

@@ -831,7 +831,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         return None
 
     raw = result.stdout.strip()
-    if not raw:
+    if not isinstance(raw, str) or not raw:
         return None
 
     try:
@@ -868,12 +868,9 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
 
     Returns dict with {accessToken, refreshToken?, expiresAt?} or None.
     """
-    # Try macOS Keychain first (covers Claude Code >=2.1.114)
     kc_creds = _read_claude_code_credentials_from_keychain()
-    if kc_creds:
-        return kc_creds
 
-    # Fall back to JSON file
+    file_creds = None
     cred_path = Path.home() / ".claude" / ".credentials.json"
     if cred_path.exists():
         try:
@@ -882,7 +879,7 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
             if oauth_data and isinstance(oauth_data, dict):
                 access_token = oauth_data.get("accessToken", "")
                 if access_token:
-                    return {
+                    file_creds = {
                         "accessToken": access_token,
                         "refreshToken": oauth_data.get("refreshToken", ""),
                         "expiresAt": oauth_data.get("expiresAt", 0),
@@ -890,6 +887,25 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
                     }
         except (json.JSONDecodeError, OSError, IOError) as e:
             logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+
+    if kc_creds and file_creds:
+        kc_valid = is_claude_code_token_valid(kc_creds)
+        file_valid = is_claude_code_token_valid(file_creds)
+        if kc_valid and not file_valid:
+            return kc_creds
+        elif file_valid and not kc_valid:
+            return file_creds
+        else:
+            kc_expires = kc_creds.get("expiresAt", 0)
+            file_expires = file_creds.get("expiresAt", 0)
+            if kc_expires >= file_expires:
+                return kc_creds
+            else:
+                return file_creds
+    elif kc_creds:
+        return kc_creds
+    elif file_creds:
+        return file_creds
 
     return None
 
@@ -1099,6 +1115,117 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
+def read_hermes_profile_anthropic_credentials() -> Optional[Dict[str, Any]]:
+    """Read Anthropic OAuth credentials from the active Hermes profile's auth.json."""
+    auth_path = Path(get_hermes_home()) / "auth.json"
+    if auth_path.exists():
+        try:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+            pool = data.get("credential_pool", {})
+            entries = pool.get("anthropic", [])
+            if isinstance(entries, list) and entries:
+                sorted_entries = sorted(entries, key=lambda e: e.get("priority", 999))
+                for entry in sorted_entries:
+                    access_token = entry.get("access_token", "")
+                    if access_token:
+                        return {
+                            "access_token": access_token,
+                            "refresh_token": entry.get("refresh_token", ""),
+                            "expires_at_ms": entry.get("expires_at_ms"),
+                            "entry_id": entry.get("id"),
+                        }
+        except Exception as e:
+            logger.debug("Failed to read Hermes profile credentials: %s", e)
+    return None
+
+
+def _is_hermes_profile_token_valid(creds: Dict[str, Any]) -> bool:
+    """Check if Hermes profile credentials have a non-expired access token."""
+    import time
+    expires_at_ms = creds.get("expires_at_ms")
+    if not expires_at_ms:
+        return bool(creds.get("access_token"))
+    now_ms = int(time.time() * 1000)
+    # Allow 60 seconds of buffer
+    return now_ms < (expires_at_ms - 60_000)
+
+
+def _write_hermes_profile_anthropic_credentials(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    entry_id: str,
+) -> None:
+    """Write refreshed Anthropic OAuth credentials back to auth.json."""
+    auth_path = Path(get_hermes_home()) / "auth.json"
+    try:
+        if not auth_path.exists():
+            data = {"version": 1, "credential_pool": {}}
+        else:
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+
+        pool = data.setdefault("credential_pool", {})
+        entries = pool.setdefault("anthropic", [])
+
+        updated = False
+        for entry in entries:
+            if entry.get("id") == entry_id:
+                entry["access_token"] = access_token
+                entry["refresh_token"] = refresh_token
+                entry["expires_at_ms"] = expires_at_ms
+                entry["last_status"] = "ok"
+                from datetime import datetime, timezone
+                data["updated_at"] = datetime.now(timezone.utc).isoformat()
+                updated = True
+                break
+
+        if not updated and entries:
+            entry = entries[0]
+            entry["access_token"] = access_token
+            entry["refresh_token"] = refresh_token
+            entry["expires_at_ms"] = expires_at_ms
+            entry["last_status"] = "ok"
+            from datetime import datetime, timezone
+            data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        tmp_path = auth_path.with_name(f"{auth_path.name}.tmp")
+        tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp_path.replace(auth_path)
+        try:
+            auth_path.chmod(0o600)
+        except OSError:
+            pass
+        logger.debug("Successfully wrote refreshed Anthropic OAuth credentials back to auth.json")
+    except Exception as e:
+        logger.debug("Failed to write refreshed Anthropic OAuth credentials: %s", e)
+
+
+def _refresh_hermes_profile_token(creds: Dict[str, Any]) -> Optional[str]:
+    """Attempt to refresh an expired Hermes profile Anthropic token."""
+    refresh_token = creds.get("refresh_token")
+    entry_id = creds.get("entry_id")
+    if not refresh_token:
+        logger.debug("No refresh token available for Hermes profile — cannot refresh")
+        return None
+    if not entry_id:
+        logger.debug("No entry_id found for Hermes profile — cannot save refresh")
+        return None
+
+    try:
+        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
+        _write_hermes_profile_anthropic_credentials(
+            refreshed["access_token"],
+            refreshed["refresh_token"],
+            refreshed["expires_at_ms"],
+            entry_id,
+        )
+        logger.debug("Successfully refreshed Hermes profile Anthropic token")
+        return refreshed["access_token"]
+    except Exception as e:
+        logger.debug("Failed to refresh Hermes profile Anthropic token: %s", e)
+        return None
+
+
 def resolve_anthropic_token() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
@@ -1106,6 +1233,8 @@ def resolve_anthropic_token() -> Optional[str]:
       1. ANTHROPIC_TOKEN env var (OAuth/setup token saved by Hermes)
       2. CLAUDE_CODE_OAUTH_TOKEN env var
       3. Claude Code credentials (~/.claude.json or ~/.claude/.credentials.json)
+         — with automatic refresh if expired and a refresh token is available
+      3.5. Hermes profile credentials (auth.json)
          — with automatic refresh if expired and a refresh token is available
       4. ANTHROPIC_API_KEY env var (regular API key, or legacy fallback)
 
@@ -1133,6 +1262,18 @@ def resolve_anthropic_token() -> Optional[str]:
     resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
     if resolved_claude_token:
         return resolved_claude_token
+
+    # 3.5. Hermes profile credential file (auth.json)
+    profile_creds = read_hermes_profile_anthropic_credentials()
+    if profile_creds:
+        if _is_hermes_profile_token_valid(profile_creds):
+            logger.debug("Using Hermes profile Anthropic credentials")
+            return profile_creds["access_token"]
+        else:
+            logger.debug("Hermes profile Anthropic credentials expired — attempting refresh")
+            refreshed = _refresh_hermes_profile_token(profile_creds)
+            if refreshed:
+                return refreshed
 
     # 4. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.

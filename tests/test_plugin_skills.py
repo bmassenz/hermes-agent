@@ -255,6 +255,24 @@ class TestSkillViewQualifiedName:
         assert result["name"] == "ticktick"
         assert "TickTick body." in result["content"]
 
+    def test_mistyped_category_qualified_local_skill_uses_unique_bare_match(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        local_skills = tmp_path / "local-skills"
+        skill_dir = local_skills / "trading-ops" / "paper-trading-rollup"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: paper-trading-rollup\ndescription: local categorized\n---\nRollup body.\n"
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", local_skills)
+
+        result = json.loads(skill_view("trading:paper-trading-rollup"))
+
+        assert result["success"] is True
+        assert result["name"] == "paper-trading-rollup"
+        assert result["resolved_from"] == "trading:paper-trading-rollup"
+        assert "Rollup body." in result["content"]
+
     def test_stale_entry_self_heals(self, tmp_path):
         from tools.skills_tool import skill_view
 

@@ -278,27 +278,40 @@ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[st
     contents: List[Dict[str, Any]] = []
     tool_name_by_call_id: Dict[str, str] = {}
 
-    for msg in messages:
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
         if not isinstance(msg, dict):
+            i += 1
             continue
         role = str(msg.get("role") or "user")
 
         if role == "system":
             system_text_parts.append(_coerce_content_to_text(msg.get("content")))
+            i += 1
             continue
 
         if role in {"tool", "function"}:
-            contents.append(
-                {
+            tool_parts = []
+            while i < len(messages):
+                curr_msg = messages[i]
+                if not isinstance(curr_msg, dict):
+                    break
+                curr_role = str(curr_msg.get("role") or "user")
+                if curr_role not in {"tool", "function"}:
+                    break
+                tool_parts.append(
+                    _translate_tool_result_to_gemini(
+                        curr_msg,
+                        tool_name_by_call_id=tool_name_by_call_id,
+                    )
+                )
+                i += 1
+            if tool_parts:
+                contents.append({
                     "role": "user",
-                    "parts": [
-                        _translate_tool_result_to_gemini(
-                            msg,
-                            tool_name_by_call_id=tool_name_by_call_id,
-                        )
-                    ],
-                }
-            )
+                    "parts": tool_parts,
+                })
             continue
 
         gemini_role = "model" if role == "assistant" else "user"
@@ -319,6 +332,7 @@ def _build_gemini_contents(messages: List[Dict[str, Any]]) -> tuple[List[Dict[st
 
         if parts:
             contents.append({"role": gemini_role, "parts": parts})
+        i += 1
 
     system_instruction = None
     joined_system = "\n".join(part for part in system_text_parts if part).strip()

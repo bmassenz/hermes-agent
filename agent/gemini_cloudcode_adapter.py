@@ -137,21 +137,36 @@ def _build_gemini_contents(
     system_text_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
 
-    for msg in messages:
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
         if not isinstance(msg, dict):
+            i += 1
             continue
         role = str(msg.get("role") or "user")
 
         if role == "system":
             system_text_parts.append(_coerce_content_to_text(msg.get("content")))
+            i += 1
             continue
 
         # Tool result message — emit a user-role turn with functionResponse
         if role == "tool" or role == "function":
-            contents.append({
-                "role": "user",
-                "parts": [_translate_tool_result_to_gemini(msg)],
-            })
+            tool_parts = []
+            while i < len(messages):
+                curr_msg = messages[i]
+                if not isinstance(curr_msg, dict):
+                    break
+                curr_role = str(curr_msg.get("role") or "user")
+                if curr_role not in ("tool", "function"):
+                    break
+                tool_parts.append(_translate_tool_result_to_gemini(curr_msg))
+                i += 1
+            if tool_parts:
+                contents.append({
+                    "role": "user",
+                    "parts": tool_parts,
+                })
             continue
 
         gemini_role = _ROLE_MAP_OPENAI_TO_GEMINI.get(role, "user")
@@ -168,11 +183,9 @@ def _build_gemini_contents(
                 if isinstance(tc, dict):
                     parts.append(_translate_tool_call_to_gemini(tc))
 
-        if not parts:
-            # Gemini rejects empty parts; skip the turn entirely
-            continue
-
-        contents.append({"role": gemini_role, "parts": parts})
+        if parts:
+            contents.append({"role": gemini_role, "parts": parts})
+        i += 1
 
     system_instruction: Optional[Dict[str, Any]] = None
     joined_system = "\n".join(p for p in system_text_parts if p).strip()
@@ -844,6 +857,16 @@ def _gemini_http_error(response: httpx.Response) -> CodeAssistError:
                 retry_delay_seconds = float(header_val)
             except (TypeError, ValueError):
                 retry_delay_seconds = None
+
+    # Fall back to parsing the error message for reset duration if still None.
+    if retry_delay_seconds is None and err_message:
+        import re
+        _reset_match = re.search(r"reset after\s*(\d+(?:\.\d+)?)\s*s", err_message, re.IGNORECASE)
+        if _reset_match:
+            try:
+                retry_delay_seconds = float(_reset_match.group(1))
+            except (TypeError, ValueError):
+                pass
 
     # Classify the error code.  ``code_assist_rate_limited`` stays the default
     # for 429s; a more specific reason tag helps downstream callers (e.g. tests,

@@ -633,6 +633,27 @@ class TestBuildGeminiRequest:
         assert fr_part["functionResponse"]["name"] == "get_weather"
         assert fr_part["functionResponse"]["response"] == {"temp": 72}
 
+    def test_consecutive_tool_results_grouped(self):
+        from agent.gemini_cloudcode_adapter import build_gemini_request
+
+        req = build_gemini_request(messages=[
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "fn1", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "fn2", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "name": "fn1", "tool_call_id": "c1", "content": "r1"},
+            {"role": "tool", "name": "fn2", "tool_call_id": "c2", "content": "r2"},
+        ])
+        # The tool results must be grouped into a single user turn containing both parts
+        last_turn = req["contents"][-1]
+        assert last_turn["role"] == "user"
+        assert len(last_turn["parts"]) == 2
+        assert last_turn["parts"][0]["functionResponse"]["name"] == "fn1"
+        assert last_turn["parts"][0]["functionResponse"]["response"] == {"output": "r1"}
+        assert last_turn["parts"][1]["functionResponse"]["name"] == "fn2"
+        assert last_turn["parts"][1]["functionResponse"]["response"] == {"output": "r2"}
+
     def test_tools_translated_to_function_declarations(self):
         from agent.gemini_cloudcode_adapter import build_gemini_request
 
@@ -1063,6 +1084,17 @@ class TestGeminiHttpErrorParsing:
         )
         err = _gemini_http_error(resp)
         assert err.retry_after == 45.0
+
+    def test_retry_after_error_message_reset_duration_fallback(self):
+        """If the body has no RetryInfo detail and no Retry-After header, fall back to parsing error message."""
+        from agent.gemini_cloudcode_adapter import _gemini_http_error
+
+        resp = self._fake_response(
+            429,
+            {"error": {"code": 429, "message": "You have exhausted your capacity on this model. Your quota will reset after 46s.", "status": "RESOURCE_EXHAUSTED"}},
+        )
+        err = _gemini_http_error(resp)
+        assert err.retry_after == 46.0
 
     def test_malformed_body_still_produces_structured_error(self):
         """Non-JSON body must not swallow status_code — we still want the classifier path."""

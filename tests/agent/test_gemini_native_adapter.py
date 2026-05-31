@@ -85,6 +85,51 @@ def test_build_native_request_uses_original_function_name_for_tool_result():
     assert tool_response["name"] == "get_weather"
 
 
+def test_build_native_request_groups_consecutive_tool_results():
+    from agent.gemini_native_adapter import build_gemini_request
+
+    request = build_gemini_request(
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "fn1", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "fn2", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "r1",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "r2",
+            },
+        ],
+        tools=[],
+        tool_choice=None,
+    )
+
+    last_turn = request["contents"][1]
+    assert last_turn["role"] == "user"
+    assert len(last_turn["parts"]) == 2
+    assert last_turn["parts"][0]["functionResponse"]["name"] == "fn1"
+    assert last_turn["parts"][0]["functionResponse"]["response"] == {"output": "r1"}
+    assert last_turn["parts"][1]["functionResponse"]["name"] == "fn2"
+    assert last_turn["parts"][1]["functionResponse"]["response"] == {"output": "r2"}
+
+
 def test_build_native_request_strips_json_schema_only_fields_from_tool_parameters():
     from agent.gemini_native_adapter import build_gemini_request
 
