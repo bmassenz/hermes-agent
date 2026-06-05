@@ -57,6 +57,138 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+def _parse_positive_int(value) -> int | None:
+    """Parse a positive integer config value."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _parse_nonnegative_float(value) -> float | None:
+    """Parse a non-negative float config value."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _resolve_cron_context_from_max_chars(cfg: dict | None = None) -> int:
+    """Maximum characters copied from upstream cron outputs into a prompt."""
+    env_value = os.getenv("HERMES_CRON_CONTEXT_FROM_MAX_CHARS", "").strip()
+    if env_value:
+        return _parse_positive_int(env_value) or 8000
+
+    if cfg is None:
+        try:
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+    cron_cfg = (cfg or {}).get("cron") or {}
+    return _parse_positive_int(cron_cfg.get("context_from_max_chars")) or 8000
+
+
+def _extract_cron_context_payload(output: str) -> str:
+    """Return the useful payload from a stored cron output artifact."""
+    text = (output or "").strip()
+    if not text:
+        return ""
+
+    if "\n## Response\n" in text:
+        payload = text.rsplit("\n## Response\n", 1)[1].strip()
+        return "" if payload == "(No response generated)" else payload
+
+    if "\n## Error\n" in text:
+        payload = text.rsplit("\n## Error\n", 1)[1].strip()
+        header = []
+        for line in text.splitlines():
+            if line.startswith("# Cron Job:") or line.startswith("**Job ID:**"):
+                header.append(line)
+            elif line.startswith("**Run Time:**") or line.startswith("**Schedule:**"):
+                header.append(line)
+        prefix = "\n".join(header).strip()
+        if prefix:
+            return f"{prefix}\n\n## Error\n\n{payload}".strip()
+        return f"## Error\n\n{payload}".strip()
+
+    return text
+
+
+def _derive_shared_workspace_root(workdir: str) -> str:
+    """Return the broad host workspace root for a cron workdir."""
+    path = Path(workdir).expanduser()
+    parts = path.parts
+    for idx in range(len(parts) - 2):
+        if parts[idx] == "Users" and parts[idx + 2] == "code":
+            return str(Path(*parts[: idx + 3]))
+    return str(path)
+
+
+def _build_workdir_path_hint(job: dict) -> str:
+    """Tell cron agents how host paths map inside container-backed tools."""
+    workdir = str(job.get("workdir") or "").strip()
+    if not workdir:
+        return ""
+    workspace_root = _derive_shared_workspace_root(workdir)
+    return (
+        "## Cron Path Context\n"
+        f"- Configured host workdir: {workdir}\n"
+        f"- Shared workspace root: {workspace_root}\n"
+        "- Prefer absolute paths under the shared workspace root for file reads. "
+        "Do not expand `~/code` to `/root/code` in container-backed cron tools; "
+        "treat `~/code/...` project instructions as paths under the shared "
+        "workspace root above.\n\n"
+    )
+
+
+def _resolve_cron_max_iterations(cfg: dict) -> int:
+    """Cron-specific max turns, falling back to existing agent defaults."""
+    cfg = cfg or {}
+    cron_cfg = cfg.get("cron") or {}
+    agent_cfg = cfg.get("agent") or {}
+    for value in (
+        cron_cfg.get("max_turns"),
+        cron_cfg.get("max_iterations"),
+        agent_cfg.get("max_turns"),
+        cfg.get("max_turns"),
+    ):
+        parsed = _parse_positive_int(value)
+        if parsed is not None:
+            return parsed
+    return 90
+
+
+def _resolve_cron_inactivity_timeout(cfg: dict) -> float:
+    """Resolve cron inactivity timeout in seconds; 0 means unlimited."""
+    env_value = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+    if env_value:
+        parsed = _parse_nonnegative_float(env_value)
+        if parsed is not None:
+            return parsed
+        logger.warning(
+            "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
+            env_value,
+        )
+        return 600.0
+
+    cron_cfg = (cfg or {}).get("cron") or {}
+    for key in ("inactivity_timeout_seconds", "timeout_seconds"):
+        parsed = _parse_nonnegative_float(cron_cfg.get(key))
+        if parsed is not None:
+            return parsed
+    return 600.0
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -1046,6 +1178,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     context_from = job.get("context_from")
     if context_from:
         from cron.jobs import OUTPUT_DIR
+        max_context_chars = _resolve_cron_context_from_max_chars()
         if isinstance(context_from, str):
             context_from = [context_from]
         for source_job_id in context_from:
@@ -1070,11 +1203,11 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 )
                 if not output_files:
                     continue  # silent skip — no output yet
-                latest_output = output_files[0].read_text(encoding="utf-8").strip()
-                # Truncate to 8K characters to avoid prompt bloat
-                _MAX_CONTEXT_CHARS = 8000
-                if len(latest_output) > _MAX_CONTEXT_CHARS:
-                    latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
+                latest_output = _extract_cron_context_payload(
+                    output_files[0].read_text(encoding="utf-8")
+                )
+                if len(latest_output) > max_context_chars:
+                    latest_output = latest_output[:max_context_chars] + "\n\n[... output truncated ...]"
                 if latest_output:
                     prompt = (
                         f"## Output from job '{source_job_id}'\n"
@@ -1102,7 +1235,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "Never combine [SILENT] with content — either report your "
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
-    prompt = cron_hint + prompt
+    prompt = cron_hint + _build_workdir_path_hint(job) + prompt
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -1115,10 +1248,36 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
+    from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
 
     parts = []
     skipped: list[str] = []
     for skill_name in skill_names:
+        # Cron jobs historically accepted only skill names here, but the CLI/gateway
+        # slash-command path lets bundles shadow skills with the same slug. Mirror
+        # that behavior so `skills: ["my-bundle"]` expands bundle members instead
+        # of being treated as a missing skill.
+        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        if bundle_key:
+            bundle_payload = build_bundle_invocation_message(
+                bundle_key,
+                user_instruction="",
+                task_id=str(job.get("id") or "") or None,
+            )
+            if bundle_payload:
+                bundle_message, _loaded_bundle_skills, _missing_bundle_skills = bundle_payload
+                if parts:
+                    parts.append("")
+                parts.append(bundle_message)
+                continue
+            logger.warning(
+                "Cron job '%s': bundle '%s' could not load any skills, skipping",
+                job.get("name", job.get("id")),
+                skill_name,
+            )
+            skipped.append(skill_name)
+            continue
+
         try:
             loaded = json.loads(skill_view(skill_name))
         except (json.JSONDecodeError, TypeError):
@@ -1182,14 +1341,22 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
       markdown — often security docs / runbooks that *describe* attack
       commands in prose. The LOOSER ``_scan_cron_skill_assembled``
       pattern set is used: only unambiguous prompt-injection directives
-      and invisible unicode block, command-shape patterns are dropped
-      to avoid false-positives. Skill bodies are vetted at install time
-      by ``skills_guard.py``.
+      block; command-shape patterns are dropped and invisible unicode is
+      sanitized (stripped + logged) rather than blocked, to avoid
+      false-positives that permanently kill a job. Skill bodies are
+      vetted at install time by ``skills_guard.py``.
     """
     from tools.cronjob_tools import _scan_cron_prompt, _scan_cron_skill_assembled
 
-    scanner = _scan_cron_skill_assembled if has_skills else _scan_cron_prompt
-    scan_error = scanner(assembled)
+    if has_skills:
+        # Skill content is install-time vetted by skills_guard.py. Invisible
+        # unicode is sanitized (not blocked) so a stray zero-width space in a
+        # skill code example can't permanently kill the job; the cleaned
+        # prompt is what actually runs.
+        cleaned, scan_error = _scan_cron_skill_assembled(assembled)
+        assembled = cleaned
+    else:
+        scan_error = _scan_cron_prompt(assembled)
     if scan_error:
         job_label = job.get("name") or job.get("id") or "<unknown>"
         logger.warning(
@@ -1534,8 +1701,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Cron jobs use tighter turn budgets than interactive Hermes sessions.
+        max_iterations = _resolve_cron_max_iterations(_cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
@@ -1573,7 +1740,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     if entry.get("api_key"):
                         fb_kwargs["explicit_api_key"] = entry["api_key"]
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
+                    if entry.get("model"):
+                        model = entry.get("model")
+                    logger.info("Job '%s': fallback resolved to %s (model: %s)", job_id, runtime.get("provider"), model)
                     break
                 except Exception as fb_exc:
                     logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
@@ -1659,22 +1828,11 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # for hours if it's actively calling tools / receiving stream tokens,
         # but a hung API call or stuck tool with no activity for the configured
         # duration is caught and killed.  Default 600s (10 min inactivity);
-        # override via HERMES_CRON_TIMEOUT env var.  0 = unlimited.
+        # override via cron config or HERMES_CRON_TIMEOUT env var.  0 = unlimited.
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
-        if _raw_cron_timeout:
-            try:
-                _cron_timeout = float(_raw_cron_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_TIMEOUT=%r; using default 600s",
-                    _raw_cron_timeout,
-                )
-                _cron_timeout = 600.0
-        else:
-            _cron_timeout = 600.0
+        _cron_timeout = _resolve_cron_inactivity_timeout(_cfg)
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
